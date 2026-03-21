@@ -1,0 +1,7 @@
+Para rodar a aplicação pelo CMD dentro da pasta dos arquivos:
+
+cd backend
+npm start
+
+cd frontend
+npm run dev
