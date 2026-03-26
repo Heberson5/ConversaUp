@@ -208,6 +208,68 @@ function getClientByConnectionId(connectionId) {
   return (conn && conn.enabled && conn.status === 'connected') ? conn.client : null;
 }
 
+// Busca foto de perfil de forma segura, com múltiplos métodos de fallback
+async function getProfilePicUrlSafe(client, chatId) {
+  if (!client) return null;
+
+  // Método 1: getProfilePicUrl padrão do whatsapp-web.js
+  try {
+    const url = await client.getProfilePicUrl(chatId);
+    if (url) return url;
+  } catch (e) {
+    // Continua para métodos alternativos
+  }
+
+  // Método 2: Acesso direto via pupPage com WidFactory
+  if (!client.pupPage) return null;
+  try {
+    const picUrl = await client.pupPage.evaluate(async (contactId) => {
+      try {
+        if (!window.Store || !window.Store.ProfilePic) return null;
+
+        // Tenta criar wid e buscar foto
+        try {
+          let wid = null;
+          if (window.Store.WidFactory && window.Store.WidFactory.createWid) {
+            wid = window.Store.WidFactory.createWid(contactId);
+          } else if (window.Store.createWid) {
+            wid = window.Store.createWid(contactId);
+          }
+          if (wid) {
+            // Corrige bug: garante que isNewsletter e isStatusV3 existem
+            Object.defineProperty(wid, 'isNewsletter', { value: false, configurable: true, writable: true });
+            Object.defineProperty(wid, 'isStatusV3', { value: false, configurable: true, writable: true });
+            const result = await window.Store.ProfilePic.profilePicFind(wid);
+            if (result && (result.eurl || result.imgFull || result.img)) return result.eurl || result.imgFull || result.img;
+          }
+        } catch {}
+
+        // Tenta buscar pelo modelo de contato
+        try {
+          const contact = window.Store.Contact.get(contactId);
+          if (contact && contact.profilePicThumb) {
+            if (contact.profilePicThumb.imgFull) return contact.profilePicThumb.imgFull;
+            if (contact.profilePicThumb.img) return contact.profilePicThumb.img;
+            // Tenta forcar o fetch
+            try {
+              await contact.profilePicThumb.fetchProfilePicture();
+              if (contact.profilePicThumb.imgFull) return contact.profilePicThumb.imgFull;
+              if (contact.profilePicThumb.img) return contact.profilePicThumb.img;
+            } catch {}
+          }
+        } catch {}
+
+        return null;
+      } catch {
+        return null;
+      }
+    }, chatId);
+    return picUrl || null;
+  } catch {
+    return null;
+  }
+}
+
 // ============================================================================
 // CRIAÇÃO DE CONEXÃO
 // ============================================================================
@@ -314,17 +376,25 @@ function createConnection(connId, name, color) {
 
     if (c && c.enabled && !isLoggingOut) {
       const retryCount = c.retryCount || 0;
-      if (retryCount < 3) {
+      if (retryCount < 5) {
         c.retryCount = retryCount + 1;
-        console.log(`🔄 Tentando reconectar ${connId} (${name}) em 10s... (tentativa ${c.retryCount}/3)`);
+        const delay = Math.min(5000 * c.retryCount, 30000);
+        console.log(`🔄 Tentando reconectar ${connId} (${name}) em ${delay/1000}s... (tentativa ${c.retryCount}/5)`);
         setTimeout(() => {
           const connNow = connections.find(c => c.id === connId);
           if (connNow && connNow.enabled && connNow.status === 'disconnected') {
             createConnection(connId, connNow.name, connNow.color);
           }
-        }, 10000);
+        }, delay);
       } else {
-        console.log(`⚠️ Máximo de tentativas atingido para ${connId} (${name}).`);
+        console.log(`⚠️ Máximo de tentativas atingido para ${connId} (${name}). Reconectando em 60s...`);
+        setTimeout(() => {
+          const connNow = connections.find(c => c.id === connId);
+          if (connNow && connNow.enabled && connNow.status === 'disconnected') {
+            connNow.retryCount = 0;
+            createConnection(connId, connNow.name, connNow.color);
+          }
+        }, 60000);
       }
     }
   });
@@ -363,6 +433,31 @@ function createConnection(connId, name, color) {
         }
         saveConnections();
         io.emit('connection:status', { connectionId: connId, status: 'disconnected' });
+
+        // Retry automático ao falhar a inicialização
+        if (c.enabled) {
+          const retryCount = c.retryCount || 0;
+          if (retryCount < 5) {
+            c.retryCount = retryCount + 1;
+            const delay = Math.min(5000 * c.retryCount, 30000);
+            console.log(`🔄 Tentando reinicializar ${connId} (${name}) em ${delay/1000}s... (tentativa ${c.retryCount}/5)`);
+            setTimeout(() => {
+              const connNow = connections.find(c => c.id === connId);
+              if (connNow && connNow.enabled && connNow.status === 'disconnected') {
+                createConnection(connId, connNow.name, connNow.color);
+              }
+            }, delay);
+          } else {
+            console.log(`⚠️ Máximo de tentativas de inicialização atingido para ${connId} (${name}). Reconectando em 60s...`);
+            setTimeout(() => {
+              const connNow = connections.find(c => c.id === connId);
+              if (connNow && connNow.enabled && connNow.status === 'disconnected') {
+                connNow.retryCount = 0;
+                createConnection(connId, connNow.name, connNow.color);
+              }
+            }, 60000);
+          }
+        }
       }
       updateLegacyClient();
     });
@@ -716,6 +811,25 @@ io.on("connection", (socket) => {
     }
     allChats.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
     socket.emit("chats", allChats);
+
+    // Busca fotos de perfil automaticamente para chats que não têm
+    (async () => {
+      const chatsNeedingPic = allChats.filter(chat => !chat.picUrl);
+      for (let i = 0; i < chatsNeedingPic.length; i++) {
+        const chat = chatsNeedingPic[i];
+        const client = getClientByConnectionId(chat.connectionId);
+        if (client) {
+          const picUrl = await getProfilePicUrlSafe(client, chat.id);
+          if (picUrl) {
+            io.emit("profile_pic_update", { id: chat.id, picUrl });
+          }
+        }
+        // Pequeno delay entre requisições para não sobrecarregar
+        if (i < chatsNeedingPic.length - 1) {
+          await new Promise(resolve => setTimeout(resolve, 150));
+        }
+      }
+    })();
   });
 
   socket.on("get_chat_messages", async (data) => {
@@ -942,6 +1056,16 @@ io.on("connection", (socket) => {
       io.emit('chat_updated', { id: chatId, unreadCount: 0 });
     } catch (error) {
       console.error('Erro ao marcar como lido:', error);
+    }
+  });
+
+  socket.on("get_profile_pic", async (data) => {
+    const { chatId, connectionId } = data;
+    const client = getClientByConnectionId(connectionId);
+    if (!client) return;
+    const picUrl = await getProfilePicUrlSafe(client, chatId);
+    if (picUrl) {
+      io.emit("profile_pic_update", { id: chatId, picUrl });
     }
   });
 

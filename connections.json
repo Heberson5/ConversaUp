@@ -1,15 +1,29 @@
 [
   {
-    "id": "e73de73d-199a-4cef-9485-11614b6ff7c6",
-    "name": "Heberson",
-    "color": "#1400a8",
-    "status": "connected",
-    "enabled": true
-  },
-  {
     "id": "1774023210633",
     "name": "Karen",
     "color": "#ea62de",
+    "status": "disconnected",
+    "enabled": false
+  },
+  {
+    "id": "1774093436794",
+    "name": "Cob. Rosangela",
+    "color": "#10e01d",
+    "status": "disconnected",
+    "enabled": false
+  },
+  {
+    "id": "1774297230676",
+    "name": "Marketing",
+    "color": "#fff93d",
+    "status": "disconnected",
+    "enabled": false
+  },
+  {
+    "id": "1774462269140",
+    "name": "Heberson",
+    "color": "#0400ff",
     "status": "connected",
     "enabled": true
   }
