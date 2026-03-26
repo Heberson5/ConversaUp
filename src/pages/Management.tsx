@@ -6,7 +6,8 @@ import {
   Search, MessageSquare, Loader2, RefreshCw, Eye, LayoutGrid, List,
   Hand, StickyNote, X, Send, User, Plus, FileText, Image as ImageIcon, Smile, Mic, StopCircle, ShieldAlert,
   Trash2, Bold, Italic, Strikethrough, Code, Quote, List as ListIcon, ListOrdered, Download, Camera, Check, Clock, Reply, Zap,
-  Headphones, BarChart2, Calendar, TreePine, Coffee, Dribbble, Car, Lightbulb, Hash, Flag, UserPlus, MapPin, Filter, FilterX, Link as LinkIcon, Navigation
+  Headphones, BarChart2, Calendar, TreePine, Coffee, Dribbble, Car, Lightbulb, Hash, Flag, UserPlus, MapPin, Filter, FilterX, Link as LinkIcon, Navigation,
+  Tag, Tags, ChevronDown, Edit2, Lock
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { toast } from 'sonner';
@@ -14,6 +15,67 @@ import { toast } from 'sonner';
 const API_BASE_URL = (typeof process !== 'undefined' && process.env.NEXT_PUBLIC_API_URL) 
   ? process.env.NEXT_PUBLIC_API_URL 
   : 'http://localhost:3001';
+
+// ============================================================================
+// SERVIÇO DE INDEXEDDB PARA MENSAGENS (SEM LIMITE DE TAMANHO)
+// ============================================================================
+const DB_NAME = 'ZapFlowDB';
+const DB_VERSION = 3; // Versão fixa
+const STORE_NAME = 'chat_messages';
+
+// Abre o banco e garante que o object store exista
+const openDB = (): Promise<IDBDatabase> => {
+  return new Promise((resolve, reject) => {
+    const request = indexedDB.open(DB_NAME, DB_VERSION);
+    request.onerror = () => reject(request.error);
+    request.onsuccess = () => {
+      resolve(request.result);
+    };
+    request.onupgradeneeded = (event) => {
+      const db = (event.target as IDBOpenDBRequest).result;
+      if (!db.objectStoreNames.contains(STORE_NAME)) {
+        const store = db.createObjectStore(STORE_NAME, { keyPath: 'id' });
+        store.createIndex('chatKey', 'chatKey', { unique: false });
+      }
+    };
+  });
+};
+
+// Salva mensagens no IndexedDB (assíncrono)
+const saveMessagesToIndexedDB = async (chatKey: string, messages: MessageType[]): Promise<void> => {
+  const db = await openDB();
+  const tx = db.transaction(STORE_NAME, 'readwrite');
+  const store = tx.objectStore(STORE_NAME);
+  for (const msg of messages) {
+    const toStore = { ...msg, chatKey };
+    store.put(toStore);
+  }
+  // Aguarda a conclusão da transação
+  return new Promise((resolve, reject) => {
+    tx.oncomplete = () => resolve();
+    tx.onerror = (event) => reject((event.target as IDBRequest).error);
+    tx.onabort = (event) => reject((event.target as IDBRequest).error);
+  });
+};
+
+// Carrega todas as mensagens de um chat
+const loadMessagesFromIndexedDB = async (chatKey: string): Promise<MessageType[]> => {
+  const db = await openDB();
+  const tx = db.transaction(STORE_NAME, 'readonly');
+  const store = tx.objectStore(STORE_NAME);
+  const index = store.index('chatKey');
+  const request = index.getAll(chatKey);
+  return new Promise((resolve) => {
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => resolve([]);
+  });
+};
+
+// Limpa mensagens do localStorage após migração
+const clearLocalStorageMessages = (chatId: string, connectionId?: string) => {
+  const key = `chat_messages_${connectionId || 'default'}_${chatId}`;
+  localStorage.removeItem(key);
+};
 
 // ============================================================================
 // TEMA ESCURO
@@ -41,6 +103,44 @@ const useDarkTheme = () => {
     media.addEventListener("change", handler);
     return () => media.removeEventListener("change", handler);
   }, []);
+};
+
+// ============================================================================
+// FUNÇÕES AUXILIARES
+// ============================================================================
+
+const resolveCurrentUserId = (): string => {
+  try {
+    const directId = localStorage.getItem('user_id');
+    if (directId) return directId;
+
+    const displayName = localStorage.getItem('user_display_name');
+    if (displayName) {
+      const rawUsers = localStorage.getItem('zapflow_mock_users');
+      const users: Array<{ id: string; name: string; displayName: string }> = rawUsers
+        ? JSON.parse(rawUsers)
+        : [
+            { id: '1', name: 'Admin Master', displayName: 'Suporte Master' },
+            { id: '2', name: 'Ricardo Silva', displayName: 'Ricardo' },
+          ];
+      const match = users.find(
+        u => u.displayName === displayName || u.name === displayName
+      );
+      if (match) return match.id;
+    }
+
+    const profileId = localStorage.getItem('user_profile_id');
+    if (profileId) return profileId;
+  } catch {}
+  return '';
+};
+
+const assignAgentToChat = (chatId: string, agentId: string) => {
+  try {
+    const assignments = JSON.parse(localStorage.getItem('chat_agent_assignments') || '{}');
+    assignments[chatId] = agentId;
+    localStorage.setItem('chat_agent_assignments', JSON.stringify(assignments));
+  } catch {}
 };
 
 // ============================================================================
@@ -141,7 +241,7 @@ const AudioVisualizer = ({ stream }: { stream: MediaStream | null }) => {
 };
 
 // ============================================================================
-// COMPONENTE DE SELEÇÃO DE EMOJIS (idêntico ao Chat)
+// COMPONENTE DE SELEÇÃO DE EMOJIS
 // ============================================================================
 const EmojiPicker = ({ onEmojiSelect }: { onEmojiSelect: (emoji: string) => void }) => {
   const [activeTab, setActiveTab] = useState<'emoji' | 'gif'>('emoji');
@@ -426,6 +526,164 @@ type MessageType = {
   [key: string]: any;
 };
 
+// ============================================================================
+// TAGS
+// ============================================================================
+const STORAGE_KEY_AUTOMATION_RULES = 'zapflow_disparo_rules';
+const STORAGE_KEY_CHAT_TAGS = 'chat_tags_assignments';
+
+const getTagsFromAutomationRules = (userId?: string): TagItem[] => {
+  if (!userId) return [];
+  try {
+    const saved = localStorage.getItem(STORAGE_KEY_AUTOMATION_RULES);
+    if (!saved) return [];
+    const rules: Array<{
+      tagName?: string;
+      tagColor?: string;
+      assignedUserIds?: string[];
+      assignedUserId?: string;
+    }> = JSON.parse(saved);
+    const seen = new Set<string>();
+    const tags: TagItem[] = [];
+    rules.forEach(rule => {
+      const ids: string[] =
+        rule.assignedUserIds && rule.assignedUserIds.length > 0
+          ? rule.assignedUserIds
+          : rule.assignedUserId
+          ? [rule.assignedUserId]
+          : [];
+      if (!ids.includes(userId)) return;
+      const name = rule.tagName?.trim();
+      if (name && !seen.has(name)) {
+        seen.add(name);
+        tags.push({
+          id: `atag_${name.toLowerCase().replace(/\s+/g, '_')}`,
+          name,
+          color: rule.tagColor || '#10b981',
+        });
+      }
+    });
+    return tags;
+  } catch {
+    return [];
+  }
+};
+
+interface TagItem {
+  id: string;
+  name: string;
+  color: string;
+}
+
+const TagBadge = ({ tag, onRemove, canRemove }: { tag: TagItem; onRemove?: () => void; canRemove?: boolean }) => (
+  <span
+    className="inline-flex items-center gap-1 text-[10px] font-bold px-2 py-0.5 rounded-full text-white select-none"
+    style={{ backgroundColor: tag.color }}
+  >
+    {tag.name}
+    {canRemove && onRemove && (
+      <button
+        onClick={(e) => { e.stopPropagation(); onRemove(); }}
+        className="ml-0.5 hover:opacity-70 transition-opacity"
+      >
+        <X size={10} />
+      </button>
+    )}
+  </span>
+);
+
+const TagSelector = ({
+  allTags,
+  selectedTagIds,
+  canManage,
+  canEdit,
+  onToggle,
+  onOpenManager,
+  onClose,
+}: {
+  allTags: TagItem[];
+  selectedTagIds: string[];
+  canManage: boolean;
+  canEdit: boolean;
+  onToggle: (tagId: string) => void;
+  onOpenManager: () => void;
+  onClose: () => void;
+}) => {
+  return (
+    <div
+      className="absolute right-0 top-[44px] bg-white dark:bg-[#111b21] rounded-xl shadow-2xl w-[280px] z-50 border border-slate-200 dark:border-slate-800 overflow-hidden animate-in slide-in-from-top-2 tag-selector-container"
+      onClick={e => e.stopPropagation()}
+    >
+      <div className="p-3 bg-[#f0f2f5] dark:bg-[#202c33] border-b border-slate-200 dark:border-slate-800 flex items-center justify-between">
+        <span className="text-xs font-bold text-slate-700 dark:text-white flex items-center gap-1.5">
+          <Tags size={14} className="text-emerald-500" />
+          Tags do Atendimento
+        </span>
+        {!canEdit && (
+          <span className="flex items-center gap-1 text-[10px] text-slate-400">
+            <Lock size={10} /> Somente leitura
+          </span>
+        )}
+      </div>
+
+      <div className="p-2 max-h-[260px] overflow-y-auto custom-scrollbar">
+        {allTags.length === 0 && (
+          <p className="text-center text-xs text-slate-400 py-4">Nenhuma tag cadastrada.</p>
+        )}
+        {allTags.map(tag => {
+          const isSelected = selectedTagIds.includes(tag.id);
+          return (
+            <button
+              key={tag.id}
+              disabled={!canEdit}
+              onClick={() => canEdit && onToggle(tag.id)}
+              className={cn(
+                "w-full flex items-center gap-3 px-3 py-2 rounded-lg mb-1 transition-all text-left",
+                canEdit ? "hover:bg-slate-50 dark:hover:bg-[#202c33] cursor-pointer" : "cursor-default opacity-70",
+                isSelected ? "bg-slate-50 dark:bg-[#202c33]" : ""
+              )}
+            >
+              <div
+                className={cn(
+                  "w-4 h-4 rounded flex items-center justify-center border-2 transition-all flex-shrink-0",
+                  isSelected ? "border-transparent" : "border-slate-300 dark:border-slate-600"
+                )}
+                style={isSelected ? { backgroundColor: tag.color, borderColor: tag.color } : {}}
+              >
+                {isSelected && <Check size={10} className="text-white" strokeWidth={3} />}
+              </div>
+              <span
+                className="text-[11px] font-bold px-2 py-0.5 rounded-full text-white flex-shrink-0"
+                style={{ backgroundColor: tag.color }}
+              >
+                {tag.name}
+              </span>
+              {isSelected && (
+                <span className="ml-auto text-[10px] text-emerald-600 dark:text-emerald-400 font-bold">Ativa</span>
+              )}
+            </button>
+          );
+        })}
+      </div>
+
+      {canManage && (
+        <div className="p-2 border-t border-slate-200 dark:border-slate-800">
+          <button
+            onClick={onOpenManager}
+            className="w-full flex items-center gap-2 px-3 py-2 text-xs text-slate-600 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-[#202c33] rounded-lg transition font-medium"
+          >
+            <Edit2 size={12} className="text-slate-400" />
+            Gerenciar lista de tags
+          </button>
+        </div>
+      )}
+    </div>
+  );
+};
+
+// ============================================================================
+// COMPONENTE PRINCIPAL
+// ============================================================================
 const Management = () => {
   useDarkTheme();
 
@@ -487,65 +745,134 @@ const Management = () => {
   const [messageForReaction, setMessageForReaction] = useState<string | null>(null);
 
   // ==========================================================================
-  // CACHE DE MENSAGENS (PERSISTENTE EM LOCALSTORAGE)
+  // TAGS
+  // ==========================================================================
+  const [currentUserId, setCurrentUserId] = useState<string>('');
+  const [allTags, setAllTags] = useState<TagItem[]>([]);
+  const [chatTags, setChatTags] = useState<Record<string, string[]>>(() => {
+    try {
+      const saved = localStorage.getItem(STORAGE_KEY_CHAT_TAGS);
+      return saved ? JSON.parse(saved) : {};
+    } catch { return {}; }
+  });
+  const [isTagSelectorOpen, setIsTagSelectorOpen] = useState(false);
+  const canEditTags = allTags.length > 0;
+  const showTagButton = allTags.length > 0;
+
+  const [agentName, setAgentName] = useState<string>("Agente");
+  const [currentAgentId, setCurrentAgentId] = useState<string>('');
+
+  useEffect(() => {
+    const uid = resolveCurrentUserId();
+    setCurrentUserId(uid);
+    if (uid) setAllTags(getTagsFromAutomationRules(uid));
+  }, []);
+
+  useEffect(() => {
+    if (typeof window !== 'undefined') {
+      const storedName = localStorage.getItem('user_display_name');
+      if (storedName) setAgentName(storedName);
+      const uid = resolveCurrentUserId();
+      setCurrentAgentId(uid);
+    }
+  }, []);
+
+  useEffect(() => {
+    try { localStorage.setItem(STORAGE_KEY_CHAT_TAGS, JSON.stringify(chatTags)); } catch {}
+  }, [chatTags]);
+
+  const refreshTagsFromAutomation = () => {
+    const uid = currentUserId || resolveCurrentUserId();
+    if (uid) setAllTags(getTagsFromAutomationRules(uid));
+  };
+
+  const toggleTagOnChat = (chatId: string, tagId: string) => {
+    if (!canEditTags) return;
+    setChatTags(prev => {
+      const current = prev[chatId] || [];
+      const updated = current.includes(tagId)
+        ? current.filter(id => id !== tagId)
+        : [...current, tagId];
+      return { ...prev, [chatId]: updated };
+    });
+  };
+
+  const getTagsForChat = (chatId: string): TagItem[] => {
+    const ids = chatTags[chatId] || [];
+    return allTags.filter(t => ids.includes(t.id));
+  };
+
+  useEffect(() => {
+    const handleClickOutside = (e: MouseEvent) => {
+      const target = e.target as Element;
+      if (isTagSelectorOpen && !target.closest('.tag-selector-container') && !target.closest('.tag-selector-trigger')) {
+        setIsTagSelectorOpen(false);
+      }
+    };
+    document.addEventListener('mousedown', handleClickOutside);
+    return () => document.removeEventListener('mousedown', handleClickOutside);
+  }, [isTagSelectorOpen]);
+
+  useEffect(() => {
+    const handleStorage = (e: StorageEvent) => {
+      if (e.key === STORAGE_KEY_AUTOMATION_RULES) {
+        refreshTagsFromAutomation();
+      }
+    };
+    window.addEventListener('storage', handleStorage);
+    return () => window.removeEventListener('storage', handleStorage);
+  }, [refreshTagsFromAutomation]);
+
+  // ==========================================================================
+  // CACHE DE MENSAGENS (MEMÓRIA + INDEXEDDB)
   // ==========================================================================
   const messagesCache = useRef<Record<string, MessageType[]>>({});
   const loadingChats = useRef<Set<string>>(new Set());
 
-  // Função para sanitizar mensagem antes de salvar (remover base64 de mídia)
-  const sanitizeForStorage = (msg: MessageType): MessageType => {
-    if (msg.hasMedia && msg.body && (msg.body.startsWith('data:') || msg.body.length > 1000)) {
-      const { body, ...rest } = msg;
-      return { ...rest, body: undefined, mediaStored: false };
-    }
-    return msg;
+  const getChatKey = (chat: ChatType): string => {
+    return `${chat.connectionId || 'default'}_${chat.id}`;
   };
 
-  // Função para carregar mensagens do localStorage para um chat
-  const loadFromLocalStorage = (chatId: string, connectionId?: string): MessageType[] | null => {
-    const key = `chat_messages_${connectionId || 'default'}_${chatId}`;
-    try {
-      const stored = localStorage.getItem(key);
-      if (stored) {
-        const msgs = JSON.parse(stored);
-        return msgs.map((m: any) => ({ ...m, mediaLoading: false, mediaLoaded: false }));
-      }
-    } catch (e) {
-      console.error("Erro ao ler localStorage:", e);
-    }
-    return null;
-  };
-
-  // Salvar mensagens no localStorage com limite e sanitização
-  const saveToLocalStorage = (chatId: string, connectionId: string | undefined, messages: MessageType[]) => {
-    const key = `chat_messages_${connectionId || 'default'}_${chatId}`;
-    try {
-      const limitedMessages = messages.slice(-500);
-      const sanitized = limitedMessages.map(sanitizeForStorage);
-      localStorage.setItem(key, JSON.stringify(sanitized));
-    } catch (e) {
-      console.error("Erro ao salvar localStorage:", e);
-      if (e.name === 'QuotaExceededError') {
+  const loadMessagesFromIndexedDBAndMigrate = async (chat: ChatType): Promise<MessageType[] | null> => {
+    const chatKey = getChatKey(chat);
+    let messages = await loadMessagesFromIndexedDB(chatKey);
+    if (messages.length === 0) {
+      // Tentar migrar do localStorage (compatibilidade com versão anterior)
+      const oldKey = `chat_messages_${chat.connectionId || 'default'}_${chat.id}`;
+      const oldStr = localStorage.getItem(oldKey);
+      if (oldStr) {
         try {
-          const keys = Object.keys(localStorage);
-          for (const k of keys) {
-            if (k.startsWith('chat_messages_')) {
-              localStorage.removeItem(k);
-              break;
-            }
+          const oldMsgs = JSON.parse(oldStr);
+          if (Array.isArray(oldMsgs) && oldMsgs.length > 0) {
+            messages = oldMsgs.map((m: any) => ({ ...m, mediaLoading: false, mediaLoaded: false }));
+            await saveMessagesToIndexedDB(chatKey, messages);
+            clearLocalStorageMessages(chat.id, chat.connectionId);
           }
-          const limited = messages.slice(-200);
-          const sanitized = limited.map(sanitizeForStorage);
-          localStorage.setItem(key, JSON.stringify(sanitized));
-        } catch (e2) {
-          console.error("Falha ao liberar espaço no localStorage", e2);
+        } catch (e) {
+          console.warn('Erro ao migrar localStorage para IndexedDB', e);
         }
       }
     }
+    return messages.length ? messages : null;
   };
 
+  const saveMessagesToDB = useCallback(async (chat: ChatType, messages: MessageType[]) => {
+    const chatKey = getChatKey(chat);
+    try {
+      await saveMessagesToIndexedDB(chatKey, messages);
+    } catch (err) {
+      console.error('Erro ao salvar mensagens no IndexedDB:', err);
+    }
+  }, []);
+
+  const updateMessagesCacheAndDB = useCallback(async (chat: ChatType, newMessages: MessageType[]) => {
+    const sorted = [...newMessages].sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
+    messagesCache.current[chat.id] = sorted;
+    await saveMessagesToDB(chat, sorted);
+  }, [saveMessagesToDB]);
+
   // ==========================================================================
-  // ESTADO PARA CONEXÕES (dropdown)
+  // ESTADO PARA CONEXÕES
   // ==========================================================================
   const [availableConnections, setAvailableConnections] = useState<{ id: string; name: string; color: string; status: string; enabled: boolean }[]>([]);
   const [connectionStatuses, setConnectionStatuses] = useState<Record<string, { status: string; enabled: boolean }>>({});
@@ -573,22 +900,25 @@ const Management = () => {
   }, []);
 
   // ==========================================================================
-  // CARREGAR MENSAGENS DO LOCALSTORAGE PARA TODOS OS CHATS QUANDO A LISTA MUDAR
+  // CARREGAR MENSAGENS DO INDEXEDDB PARA TODOS OS CHATS (background)
   // ==========================================================================
   useEffect(() => {
     if (chats.length === 0) return;
-    chats.forEach(chat => {
-      if (!messagesCache.current[chat.id]) {
-        const stored = loadFromLocalStorage(chat.id, chat.connectionId);
-        if (stored) {
-          messagesCache.current[chat.id] = stored;
+    const loadAll = async () => {
+      for (const chat of chats) {
+        if (!messagesCache.current[chat.id]) {
+          const stored = await loadMessagesFromIndexedDBAndMigrate(chat);
+          if (stored) {
+            messagesCache.current[chat.id] = stored;
+          }
         }
       }
-    });
+    };
+    loadAll();
   }, [chats]);
 
   // ==========================================================================
-  // CARREGAR MENSAGENS EM SEGUNDO PLANO PARA TODOS OS CHATS
+  // CARREGAR MENSAGENS EM SEGUNDO PLANO DO SERVIDOR (apenas se necessário)
   // ==========================================================================
   useEffect(() => {
     if (chats.length === 0) return;
@@ -604,7 +934,7 @@ const Management = () => {
   }, [chats]);
 
   // ==========================================================================
-  // BUSCAR MÍDIA SOB DEMANDA (igual ao Chat.tsx)
+  // BUSCAR MÍDIA SOB DEMANDA
   // ==========================================================================
   const fetchMedia = useCallback((messageId: string, chatId: string, connectionId?: string) => {
     console.log(`🔍 fetchMedia chamado para mensagem ${messageId} do chat ${chatId} (conexão ${connectionId})`);
@@ -621,43 +951,38 @@ const Management = () => {
     });
   }, []);
 
-  // Atualizar mensagem no estado com mídia baixada e persistir no localStorage
-  const updateMessageWithMedia = useCallback((chatId: string, messageId: string, mediaData: any) => {
-    if (messagesCache.current[chatId]) {
-      messagesCache.current[chatId] = messagesCache.current[chatId].map(msg => 
-        msg.id === messageId ? { 
-          ...msg, 
-          body: mediaData.media, 
-          mimetype: mediaData.mimetype, 
-          filename: mediaData.filename, 
-          mediaLoaded: true 
-        } : msg
-      );
-      const conn = chats.find(c => c.id === chatId);
-      if (conn) saveToLocalStorage(chatId, conn.connectionId, messagesCache.current[chatId]);
+  const updateMessageWithMedia = useCallback((chat: ChatType, messageId: string, mediaData: any) => {
+    const updateFn = (msgs: MessageType[]) => msgs.map(msg =>
+      msg.id === messageId ? {
+        ...msg,
+        body: mediaData.media,
+        mimetype: mediaData.mimetype,
+        filename: mediaData.filename,
+        mediaLoaded: true,
+        mediaLoading: false
+      } : msg
+    );
+    if (messagesCache.current[chat.id]) {
+      const updated = updateFn(messagesCache.current[chat.id]);
+      messagesCache.current[chat.id] = updated;
+      saveMessagesToDB(chat, updated);
     }
-    
-    if (activeChatRef.current?.id === chatId) {
-      setChatMessages(prev => 
-        prev.map(msg => msg.id === messageId ? { 
-          ...msg, 
-          body: mediaData.media, 
-          mimetype: mediaData.mimetype, 
-          filename: mediaData.filename, 
-          mediaLoaded: true 
-        } : msg)
-      );
+    if (activeChatRef.current?.id === chat.id) {
+      setChatMessages(prev => updateFn(prev));
     }
-  }, [chats]);
+  }, [saveMessagesToDB]);
 
   // ==========================================================================
-  // RECEBER MENSAGENS DO SERVIDOR (atualiza cache e persistência)
+  // RECEBER MENSAGENS DO SERVIDOR (atualiza cache e IndexedDB)
   // ==========================================================================
   useEffect(() => {
-    const handleChatMessages = (data: any) => {
+    const handleChatMessages = async (data: any) => {
       let msgs = data?.messages || [];
       const chatId = data.chatId;
       if (!chatId) return;
+
+      const chat = chats.find(c => c.id === chatId);
+      if (!chat) return;
 
       // Remove duplicatas
       const uniqueMessages = msgs.reduce((acc: MessageType[], curr: MessageType) => {
@@ -670,19 +995,14 @@ const Management = () => {
       const msgsWithFlags = uniqueMessages.map((msg: any) => ({ ...msg, mediaLoading: false, mediaLoaded: false }));
 
       // Atualiza cache
-      if (messagesCache.current[chatId]) {
-        const existing = messagesCache.current[chatId];
-        const merged = [...existing, ...msgsWithFlags];
-        const final = merged.filter((msg, index, self) => self.findIndex(m => m.id === msg.id) === index);
-        final.sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
-        messagesCache.current[chatId] = final;
-      } else {
-        messagesCache.current[chatId] = msgsWithFlags;
-      }
+      let existing = messagesCache.current[chatId] || [];
+      const merged = [...existing, ...msgsWithFlags];
+      const final = merged.filter((msg, index, self) => self.findIndex(m => m.id === msg.id) === index);
+      final.sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
+      messagesCache.current[chatId] = final;
 
-      // Persiste no localStorage
-      const chat = chats.find(c => c.id === chatId);
-      if (chat) saveToLocalStorage(chatId, chat.connectionId, messagesCache.current[chatId]);
+      // Persiste no IndexedDB
+      await saveMessagesToDB(chat, final);
 
       // Se for o chat ativo, atualiza a interface
       if (activeChatRef.current?.id === chatId) {
@@ -692,9 +1012,12 @@ const Management = () => {
       loadingChats.current.delete(chatId);
     };
 
-    const handleNewMessage = (data: any) => {
+    const handleNewMessage = async (data: any) => {
       const chatKey = data.chatId || data.from || data.to;
       if (!chatKey) return;
+
+      const chat = chats.find(c => c.id === chatKey);
+      if (!chat) return;
 
       const msgWithFlags = { ...data, mediaLoading: false, mediaLoaded: false };
       if (!messagesCache.current[chatKey]) messagesCache.current[chatKey] = [];
@@ -702,9 +1025,7 @@ const Management = () => {
       if (!msgWithFlags.id || !messagesCache.current[chatKey].some(m => m.id === msgWithFlags.id)) {
         messagesCache.current[chatKey].push(msgWithFlags);
         messagesCache.current[chatKey].sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
-
-        const chat = chats.find(c => c.id === chatKey);
-        if (chat) saveToLocalStorage(chatKey, chat.connectionId, messagesCache.current[chatKey]);
+        await saveMessagesToDB(chat, messagesCache.current[chatKey]);
       }
 
       if (activeChatRef.current?.id === chatKey) {
@@ -729,20 +1050,17 @@ const Management = () => {
       socket.off("receive_message", handleNewMessage);
       socket.off("chat_messages_error");
     };
-  }, [chats]);
+  }, [chats, saveMessagesToDB]);
 
   // ==========================================================================
-  // EVENTOS DE LISTA DE CHATS (com deduplicação)
+  // EVENTOS DE LISTA DE CHATS
   // ==========================================================================
   useEffect(() => {
     const handleChats = (data: ChatType[]) => {
       const filtered = (data || []).filter(c => c && c.id && !c.id.includes('status@') && !c.id.includes('@broadcast') && !c.isGroup);
       setChats(prev => {
-        // Combinar chats existentes com novos
         const combined = [...prev, ...filtered];
-        // Remover duplicatas por id
         const unique = combined.filter((c, idx, self) => self.findIndex(t => t.id === c.id) === idx);
-        // Preservar agentes existentes
         const result = unique.map(newChat => {
           const existing = prev.find(p => p.id === newChat.id);
           return {
@@ -774,16 +1092,30 @@ const Management = () => {
       setIsInterfering(false);
       setIsNoteMode(false);
       setIsLoadingMessages(true);
+      setIsTagSelectorOpen(false);
 
-      if (messagesCache.current[activeAdminChat.id]) {
-        setChatMessages(messagesCache.current[activeAdminChat.id]);
-        setIsLoadingMessages(false);
-      } else {
-        if (!loadingChats.current.has(activeAdminChat.id)) {
-          loadingChats.current.add(activeAdminChat.id);
-          socket.emit("get_chat_messages", { chatId: activeAdminChat.id, connectionId: activeAdminChat.connectionId });
+      const loadChat = async () => {
+        // Primeiro tenta carregar do IndexedDB
+        let msgs = messagesCache.current[activeAdminChat.id];
+        if (!msgs) {
+          const stored = await loadMessagesFromIndexedDBAndMigrate(activeAdminChat);
+          if (stored) {
+            msgs = stored;
+            messagesCache.current[activeAdminChat.id] = msgs;
+          }
         }
-      }
+        if (msgs && msgs.length > 0) {
+          setChatMessages(msgs);
+          setIsLoadingMessages(false);
+        } else {
+          // Se não houver localmente, pede ao servidor
+          if (!loadingChats.current.has(activeAdminChat.id)) {
+            loadingChats.current.add(activeAdminChat.id);
+            socket.emit("get_chat_messages", { chatId: activeAdminChat.id, connectionId: activeAdminChat.connectionId });
+          }
+        }
+      };
+      loadChat();
 
       if (!activeAdminChat.picUrl && !activeAdminChat.profilePicUrl && !activeAdminChat.profilePic) {
         socket.emit("request_profile_pic", { id: activeAdminChat.id });
@@ -807,36 +1139,33 @@ const Management = () => {
               msg.id === data.id ? { ...msg, ack: data.ack } : msg
             );
             const chat = chats.find(c => c.id === data.chatId);
-            if (chat) saveToLocalStorage(data.chatId, chat.connectionId, messagesCache.current[data.chatId]);
+            if (chat) saveMessagesToDB(chat, messagesCache.current[data.chatId]);
           }
         }
       };
 
-      const handleInternalNote = (data: any) => {
+      const handleInternalNote = async (data: any) => {
         if (data.chatId === activeChatRef.current?.id) {
           const noteMsg = { id: Date.now().toString(), text: data.text, sender: 'system_note' };
           setChatMessages(prev => [...prev, noteMsg]);
           if (messagesCache.current[data.chatId]) {
             messagesCache.current[data.chatId].push(noteMsg);
             const chat = chats.find(c => c.id === data.chatId);
-            if (chat) saveToLocalStorage(data.chatId, chat.connectionId, messagesCache.current[data.chatId]);
+            if (chat) await saveMessagesToDB(chat, messagesCache.current[data.chatId]);
           }
         }
       };
 
-      const handleMessageReaction = (data: { messageId: string; chatId: string; reaction: string; fromMe: boolean }) => {
+      const handleMessageReaction = async (data: { messageId: string; chatId: string; reaction: string; fromMe: boolean }) => {
         if (activeChatRef.current && data.chatId === activeChatRef.current.id) {
-          setChatMessages(prev =>
-            prev.map(msg =>
-              msg.id === data.messageId ? { ...msg, reaction: data.reaction } : msg
-            )
+          const updateFn = (msgs: MessageType[]) => msgs.map(msg =>
+            msg.id === data.messageId ? { ...msg, reaction: data.reaction } : msg
           );
+          setChatMessages(prev => updateFn(prev));
           if (messagesCache.current[data.chatId]) {
-            messagesCache.current[data.chatId] = messagesCache.current[data.chatId].map(msg =>
-              msg.id === data.messageId ? { ...msg, reaction: data.reaction } : msg
-            );
+            messagesCache.current[data.chatId] = updateFn(messagesCache.current[data.chatId]);
             const chat = chats.find(c => c.id === data.chatId);
-            if (chat) saveToLocalStorage(data.chatId, chat.connectionId, messagesCache.current[data.chatId]);
+            if (chat) await saveMessagesToDB(chat, messagesCache.current[data.chatId]);
           }
         }
       };
@@ -852,12 +1181,10 @@ const Management = () => {
         socket.off("message_reaction", handleMessageReaction);
       };
     }
-  }, [activeAdminChat, chats]);
+  }, [activeAdminChat, chats, saveMessagesToDB]);
 
-  // Atualiza a ref do chat ativo
   useEffect(() => { activeChatRef.current = activeAdminChat; }, [activeAdminChat]);
 
-  // Auto-scroll para o final quando novas mensagens chegam
   useEffect(() => {
     if (scrollRef.current && !isLoadingMessages) {
       scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
@@ -865,29 +1192,30 @@ const Management = () => {
   }, [chatMessages, isLoadingMessages]);
 
   // ==========================================================================
-  // AÇÕES DO USUÁRIO
+  // AÇÕES DO USUÁRIO (enviar mensagem, arquivos, etc.) – adaptadas para salvar no IndexedDB
   // ==========================================================================
   const toggleInterference = () => {
     if (!activeAdminChat) return;
     const newState = !isInterfering;
     setIsInterfering(newState);
     socket.emit("interfere_chat", { chatId: activeAdminChat.id, isBlocked: newState });
+    if (newState && currentAgentId) {
+      assignAgentToChat(activeAdminChat.id, currentAgentId);
+      setChats(prev => prev.map(c => c.id === activeAdminChat.id ? { ...c, agent: agentName } : c));
+    }
     toast.info(newState ? "Agente bloqueado. Você pode enviar mensagens." : "Agente desbloqueado.");
   };
 
   const canSend = isInterfering || isNoteMode;
 
-  const [agentName, setAgentName] = useState<string>("Agente");
-  useEffect(() => {
-    if (typeof window !== 'undefined') {
-      const storedName = localStorage.getItem('user_display_name');
-      if (storedName) setAgentName(storedName);
-    }
-  }, []);
-
-  const handleSendAdminMessage = () => {
+  const handleSendAdminMessage = async () => {
     if (!adminMessage.trim() || !activeAdminChat) return;
     if (!canSend) return;
+
+    if (!isNoteMode && currentAgentId) {
+      assignAgentToChat(activeAdminChat.id, currentAgentId);
+      setChats(prev => prev.map(c => c.id === activeAdminChat.id ? { ...c, agent: agentName } : c));
+    }
 
     const tempMsg: MessageType = {
       id: Date.now().toString(),
@@ -910,7 +1238,7 @@ const Management = () => {
       setChatMessages(prev => [...prev, noteMsg]);
       if (messagesCache.current[activeAdminChat.id]) {
         messagesCache.current[activeAdminChat.id].push(noteMsg);
-        saveToLocalStorage(activeAdminChat.id, activeAdminChat.connectionId, messagesCache.current[activeAdminChat.id]);
+        await saveMessagesToDB(activeAdminChat, messagesCache.current[activeAdminChat.id]);
       }
     } else {
       setChats(prev => prev.map(c => c.id === activeAdminChat.id ? { ...c, agent: agentName } : c));
@@ -925,7 +1253,7 @@ const Management = () => {
       setChatMessages(prev => [...prev, tempMsg]);
       if (messagesCache.current[activeAdminChat.id]) {
         messagesCache.current[activeAdminChat.id].push(tempMsg);
-        saveToLocalStorage(activeAdminChat.id, activeAdminChat.connectionId, messagesCache.current[activeAdminChat.id]);
+        await saveMessagesToDB(activeAdminChat, messagesCache.current[activeAdminChat.id]);
       }
 
       setChats(prev => {
@@ -949,12 +1277,12 @@ const Management = () => {
     setIsQuickRepliesOpen(false);
   };
 
-  const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     if (!isInterfering) return;
     const file = e.target.files?.[0];
     if (!file || !activeAdminChat) return;
     const reader = new FileReader();
-    reader.onload = () => {
+    reader.onload = async () => {
       const result = reader.result as string;
       const base64 = result.split(',')[1];
       const tempMsg: MessageType = {
@@ -973,7 +1301,7 @@ const Management = () => {
       setChatMessages(prev => [...prev, tempMsg]);
       if (messagesCache.current[activeAdminChat.id]) {
         messagesCache.current[activeAdminChat.id].push(tempMsg);
-        saveToLocalStorage(activeAdminChat.id, activeAdminChat.connectionId, messagesCache.current[activeAdminChat.id]);
+        await saveMessagesToDB(activeAdminChat, messagesCache.current[activeAdminChat.id]);
       }
       socket.emit("send_message", {
         to: activeAdminChat.id,
@@ -989,7 +1317,7 @@ const Management = () => {
     e.target.value = '';
   };
 
-  const handleSendPoll = () => {
+  const handleSendPoll = async () => {
     if (!activeAdminChat || !canSend) return;
     const validOptions = pollForm.options.filter(o => o.trim() !== '');
     if (!pollForm.question.trim() || validOptions.length < 2) {
@@ -1009,7 +1337,7 @@ const Management = () => {
     setChatMessages(prev => [...prev, tempMsg]);
     if (messagesCache.current[activeAdminChat.id]) {
       messagesCache.current[activeAdminChat.id].push(tempMsg);
-      saveToLocalStorage(activeAdminChat.id, activeAdminChat.connectionId, messagesCache.current[activeAdminChat.id]);
+      await saveMessagesToDB(activeAdminChat, messagesCache.current[activeAdminChat.id]);
     }
     socket.emit("send_message", { to: activeAdminChat.id, type: 'poll', poll: pollData });
     setIsPollModalOpen(false);
@@ -1017,7 +1345,7 @@ const Management = () => {
     toast.success("Enquete enviada!");
   };
 
-  const handleSendEvent = () => {
+  const handleSendEvent = async () => {
     if (!activeAdminChat || !canSend) return;
     if (!eventForm.name.trim() || !eventForm.date) {
       toast.error('Preencha o nome e a data do evento.');
@@ -1035,7 +1363,7 @@ const Management = () => {
     setChatMessages(prev => [...prev, tempMsg]);
     if (messagesCache.current[activeAdminChat.id]) {
       messagesCache.current[activeAdminChat.id].push(tempMsg);
-      saveToLocalStorage(activeAdminChat.id, activeAdminChat.connectionId, messagesCache.current[activeAdminChat.id]);
+      await saveMessagesToDB(activeAdminChat, messagesCache.current[activeAdminChat.id]);
     }
     socket.emit("send_message", { to: activeAdminChat.id, type: 'event', event: eventForm });
     setIsEventModalOpen(false);
@@ -1043,7 +1371,7 @@ const Management = () => {
     toast.success("Evento criado e enviado!");
   };
 
-  const handleSendContact = (contact: { name: string; number: string }) => {
+  const handleSendContact = async (contact: { name: string; number: string }) => {
     if (!activeAdminChat || !canSend) return;
     const tempMsg: MessageType = {
       id: Date.now().toString(),
@@ -1057,7 +1385,7 @@ const Management = () => {
     setChatMessages(prev => [...prev, tempMsg]);
     if (messagesCache.current[activeAdminChat.id]) {
       messagesCache.current[activeAdminChat.id].push(tempMsg);
-      saveToLocalStorage(activeAdminChat.id, activeAdminChat.connectionId, messagesCache.current[activeAdminChat.id]);
+      await saveMessagesToDB(activeAdminChat, messagesCache.current[activeAdminChat.id]);
     }
     socket.emit("send_message", { to: activeAdminChat.id, type: 'contact', contact: contact });
     setIsContactModalOpen(false);
@@ -1115,7 +1443,7 @@ const Management = () => {
     setLocSearchQuery('');
   };
 
-  const handleSendLocation = () => {
+  const handleSendLocation = async () => {
     if (!activeAdminChat || !canSend) return;
     const tempMsg: MessageType = {
       id: Date.now().toString(),
@@ -1129,7 +1457,7 @@ const Management = () => {
     setChatMessages(prev => [...prev, tempMsg]);
     if (messagesCache.current[activeAdminChat.id]) {
       messagesCache.current[activeAdminChat.id].push(tempMsg);
-      saveToLocalStorage(activeAdminChat.id, activeAdminChat.connectionId, messagesCache.current[activeAdminChat.id]);
+      await saveMessagesToDB(activeAdminChat, messagesCache.current[activeAdminChat.id]);
     }
     socket.emit("send_message", { to: activeAdminChat.id, type: 'location', location: locationData });
     setIsLocationModalOpen(false);
@@ -1167,12 +1495,12 @@ const Management = () => {
     } catch (err) { toast.error("Sem microfone."); }
   };
 
-  const stopAndSendRecording = () => {
+  const stopAndSendRecording = async () => {
     if (mediaRecorder.current) {
-      mediaRecorder.current.onstop = () => {
+      mediaRecorder.current.onstop = async () => {
         const audioBlob = new Blob(audioChunks.current, { type: 'audio/webm' });
         const reader = new FileReader();
-        reader.onload = () => {
+        reader.onload = async () => {
           const base64 = (reader.result as string).split(',')[1];
           const tempMsg: MessageType = {
             id: Date.now().toString(),
@@ -1190,7 +1518,7 @@ const Management = () => {
           setChatMessages(prev => [...prev, tempMsg]);
           if (messagesCache.current[activeAdminChat.id]) {
             messagesCache.current[activeAdminChat.id].push(tempMsg);
-            saveToLocalStorage(activeAdminChat.id, activeAdminChat.connectionId, messagesCache.current[activeAdminChat.id]);
+            await saveMessagesToDB(activeAdminChat, messagesCache.current[activeAdminChat.id]);
           }
           socket.emit("send_message", {
             to: activeAdminChat!.id,
@@ -1303,11 +1631,11 @@ const Management = () => {
         m.mediaLoading = true;
         fetchMedia(m.id!, activeAdminChat.id, activeAdminChat.connectionId)
           .then((mediaData: any) => {
-            updateMessageWithMedia(activeAdminChat.id, m.id!, mediaData);
+            updateMessageWithMedia(activeAdminChat, m.id!, mediaData);
           })
           .catch(err => {
             console.error("Erro ao carregar mídia", err);
-            updateMessageWithMedia(activeAdminChat.id, m.id!, { media: null, mimetype: m.mimetype, filename: m.filename });
+            updateMessageWithMedia(activeAdminChat, m.id!, { media: null, mimetype: m.mimetype, filename: m.filename });
           });
       }
       if (isImage) {
@@ -1586,6 +1914,8 @@ const Management = () => {
     const isActiveNameJustNumber = !activeHasLetters || activeAdminChat.name === cleanActiveId;
     const showActiveSubInfo = !isActiveGroup && !isActiveNameJustNumber;
 
+    const currentChatTagIds = chatTags[activeAdminChat.id] || [];
+
     return (
       <AppLayout>
         {/* Modais (localização, enquete, evento, contato, reação) */}
@@ -1776,8 +2106,59 @@ const Management = () => {
                 <button onClick={() => setIsNoteMode(!isNoteMode)} className={cn("px-4 py-2 rounded-xl text-xs font-bold transition flex items-center gap-2 shadow-sm", isNoteMode ? "bg-amber-400 text-amber-900" : "bg-slate-800 dark:bg-slate-700 text-slate-300 dark:text-slate-200 hover:bg-slate-700 dark:hover:bg-slate-600")}>
                   <StickyNote size={16} /> Nota Interna
                 </button>
+
+                {showTagButton && (
+                  <div className="relative">
+                    <button
+                      onClick={() => {
+                        if (!isTagSelectorOpen) refreshTagsFromAutomation();
+                        setIsTagSelectorOpen(!isTagSelectorOpen);
+                      }}
+                      className={cn(
+                        "tag-selector-trigger p-2 rounded-full transition flex items-center gap-1.5",
+                        isTagSelectorOpen
+                          ? "bg-emerald-100 dark:bg-emerald-500/20 text-emerald-600 dark:text-emerald-400"
+                          : "text-[#54656f] dark:text-[#aebac1] hover:bg-slate-200 dark:hover:bg-[#2a3942]"
+                      )}
+                      title="Tags do atendimento"
+                    >
+                      <Tag size={20} />
+                      {currentChatTagIds.length > 0 && (
+                        <span className="text-[10px] font-bold bg-emerald-500 text-white rounded-full w-4 h-4 flex items-center justify-center">
+                          {currentChatTagIds.length}
+                        </span>
+                      )}
+                    </button>
+
+                    {isTagSelectorOpen && (
+                      <TagSelector
+                        allTags={allTags}
+                        selectedTagIds={currentChatTagIds}
+                        canManage={false}
+                        canEdit={canEditTags}
+                        onToggle={(tagId) => toggleTagOnChat(activeAdminChat.id, tagId)}
+                        onOpenManager={() => {}}
+                        onClose={() => setIsTagSelectorOpen(false)}
+                      />
+                    )}
+                  </div>
+                )}
               </div>
             </div>
+
+            {currentChatTagIds.length > 0 && (
+              <div className="bg-[#f0f2f5] dark:bg-[#202c33] px-6 py-1.5 flex flex-wrap gap-1.5 border-b border-slate-200 dark:border-slate-700">
+                {getTagsForChat(activeAdminChat.id).map(tag => (
+                  <TagBadge
+                    key={tag.id}
+                    tag={tag}
+                    canRemove={canEditTags}
+                    onRemove={() => toggleTagOnChat(activeAdminChat.id, tag.id)}
+                  />
+                ))}
+              </div>
+            )}
+
             <div ref={scrollRef} className="flex-1 overflow-y-auto p-4 space-y-3 custom-scrollbar relative z-10">
               {!isLoadingMessages && displayedMessages.length > 0 && (
                 <div className="text-center py-3">
@@ -1937,6 +2318,12 @@ const Management = () => {
               <h1 className="text-2xl font-bold">Gestão Global</h1>
               <p className="text-slate-500 dark:text-slate-400">Supervisione e interfira em todas as conversas em tempo real.</p>
             </div>
+            {showTagButton && (
+              <div className="flex items-center gap-1 text-xs bg-slate-100 dark:bg-slate-800 px-3 py-1.5 rounded-full">
+                <Tags size={14} className="text-emerald-500" />
+                <span>{allTags.length} tag(s) disponíveis</span>
+              </div>
+            )}
           </div>
           <div className="bg-white dark:bg-slate-900 rounded-2xl border border-slate-100 dark:border-slate-800 shadow-sm overflow-hidden flex flex-col">
             <div className="p-4 border-b border-slate-100 dark:border-slate-800 bg-slate-50 dark:bg-slate-800/50 flex flex-col gap-4">
@@ -1997,45 +2384,54 @@ const Management = () => {
               )}
             </div>
             <div className={cn("p-4 flex-1 overflow-y-auto min-h-[400px]", viewMode === 'grid' ? "grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4" : "divide-y divide-slate-100 dark:divide-slate-800 space-y-2")}>
-              {filteredChats.map((chat) => (
-                <div key={chat.id} className={cn("hover:bg-blue-50/30 dark:hover:bg-slate-800/50 transition-colors flex justify-between", viewMode === 'grid' ? "flex-col p-5 bg-white dark:bg-slate-800 shadow-sm border border-slate-100 dark:border-slate-700 rounded-2xl gap-4 relative" : "items-center p-4 relative")}>
-                  {chat.unread > 0 && <div className="absolute top-4 right-4 bg-emerald-500 text-white w-5 h-5 flex items-center justify-center rounded-full text-[10px] font-bold shadow-sm">{chat.unread}</div>}
-                  <div className="flex items-start gap-4 min-w-0 w-full">
-                    <div className="w-12 h-12 rounded-full overflow-hidden flex items-center justify-center bg-slate-100 dark:bg-slate-700 shadow-sm flex-shrink-0 border border-slate-200 dark:border-slate-600">
-                      {getProfilePic(chat) ? (
-                        <img
-                          src={getProfilePic(chat)}
-                          className="w-full h-full object-cover"
-                          onError={(e) => {
-                            e.currentTarget.style.display = 'none';
-                            const parent = e.currentTarget.parentElement;
-                            if (parent) parent.innerHTML = '<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-user text-slate-400"><path d="M19 21v-2a4 4 0 0 0-4-4H9a4 4 0 0 0-4 4v2"></path><circle cx="12" cy="7" r="4"></circle></svg>';
-                          }}
-                          alt="avatar"
-                        />
-                      ) : <User size={24} className="text-slate-400" />}
-                    </div>
-                    <div className="min-w-0 flex-1 pr-6">
-                      <p className="font-bold truncate text-[15px] flex items-center gap-2">
-                        {chat.connectionColor && (
-                          <span className="w-3 h-3 rounded-full" style={{ backgroundColor: chat.connectionColor }} title={chat.connectionName} />
+              {filteredChats.map((chat) => {
+                const chatTagIds = chatTags[chat.id] || [];
+                const chatTagsList = allTags.filter(t => chatTagIds.includes(t.id));
+                return (
+                  <div key={chat.id} className={cn("hover:bg-blue-50/30 dark:hover:bg-slate-800/50 transition-colors flex justify-between", viewMode === 'grid' ? "flex-col p-5 bg-white dark:bg-slate-800 shadow-sm border border-slate-100 dark:border-slate-700 rounded-2xl gap-4 relative" : "items-center p-4 relative")}>
+                    {chat.unread > 0 && <div className="absolute top-4 right-4 bg-emerald-500 text-white w-5 h-5 flex items-center justify-center rounded-full text-[10px] font-bold shadow-sm">{chat.unread}</div>}
+                    <div className="flex items-start gap-4 min-w-0 w-full">
+                      <div className="w-12 h-12 rounded-full overflow-hidden flex items-center justify-center bg-slate-100 dark:bg-slate-700 shadow-sm flex-shrink-0 border border-slate-200 dark:border-slate-600">
+                        {getProfilePic(chat) ? (
+                          <img
+                            src={getProfilePic(chat)}
+                            className="w-full h-full object-cover"
+                            onError={(e) => {
+                              e.currentTarget.style.display = 'none';
+                              const parent = e.currentTarget.parentElement;
+                              if (parent) parent.innerHTML = '<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-user text-slate-400"><path d="M19 21v-2a4 4 0 0 0-4-4H9a4 4 0 0 0-4 4v2"></path><circle cx="12" cy="7" r="4"></circle></svg>';
+                            }}
+                            alt="avatar"
+                          />
+                        ) : <User size={24} className="text-slate-400" />}
+                      </div>
+                      <div className="min-w-0 flex-1 pr-6">
+                        <p className="font-bold truncate text-[15px] flex items-center gap-2">
+                          {chat.connectionColor && (
+                            <span className="w-3 h-3 rounded-full" style={{ backgroundColor: chat.connectionColor }} title={chat.connectionName} />
+                          )}
+                          {chat.name}
+                        </p>
+                        <p className="text-[13px] text-slate-500 line-clamp-2 leading-tight">{chat.lastMessage || <span className="italic opacity-60">Mídia</span>}</p>
+                        {chat.agent && (
+                          <p className="text-[12px] text-emerald-600 dark:text-emerald-400 font-medium mt-1">👤 Atendido por: {chat.agent}</p>
                         )}
-                        {chat.name}
-                      </p>
-                      <p className="text-[13px] text-slate-500 line-clamp-2 leading-tight">{chat.lastMessage || <span className="italic opacity-60">Mídia</span>}</p>
-                      {chat.agent && (
-                        <p className="text-[12px] text-emerald-600 dark:text-emerald-400 font-medium mt-1">👤 Atendido por: {chat.agent}</p>
-                      )}
+                        {chatTagsList.length > 0 && (
+                          <div className="flex flex-wrap gap-1 mt-1.5">
+                            {chatTagsList.map(tag => <TagBadge key={tag.id} tag={tag} />)}
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                    <div className={cn("flex items-center gap-3", viewMode === 'grid' ? "w-full justify-between mt-auto pt-4 border-t border-slate-100 dark:border-slate-700/50" : "flex-shrink-0")}>
+                      <div className="flex items-center gap-1.5 text-slate-400">
+                        <Clock size={12} /><span className="text-[11px] font-bold">{formatLastMessageTime(chat)}</span>
+                      </div>
+                      <button onClick={() => setActiveAdminChat(chat)} className="px-4 py-2 bg-slate-900 dark:bg-blue-600 text-white rounded-xl text-xs font-bold flex items-center gap-2"><Eye size={14} /> Espiar</button>
                     </div>
                   </div>
-                  <div className={cn("flex items-center gap-3", viewMode === 'grid' ? "w-full justify-between mt-auto pt-4 border-t border-slate-100 dark:border-slate-700/50" : "flex-shrink-0")}>
-                    <div className="flex items-center gap-1.5 text-slate-400">
-                      <Clock size={12} /><span className="text-[11px] font-bold">{formatLastMessageTime(chat)}</span>
-                    </div>
-                    <button onClick={() => setActiveAdminChat(chat)} className="px-4 py-2 bg-slate-900 dark:bg-blue-600 text-white rounded-xl text-xs font-bold flex items-center gap-2"><Eye size={14} /> Espiar</button>
-                  </div>
-                </div>
-              ))}
+                );
+              })}
             </div>
           </div>
         </div>
